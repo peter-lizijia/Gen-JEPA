@@ -1,0 +1,17 @@
+# 基础信息
+name: "convnext_isotropic_base"
+dinov2_variant: "vits14"
+img_size: [224, 224]
+patch_size: 14
+
+input_dim: 384 
+
+
+# VAE 内部结构参数（根据你的 ConvNeXtIsotropicVAE 需求设定）
+depth: 18
+dim: 768            # VAE 内部隐层维度
+latent_channels: 16 # 瓶颈层通道数
+drop_path_rate: 0
+layer_scale_init_value: 0
+shape: [16, 16]     # 特征图分辨率 (224/14 = 16)
+beta: 0

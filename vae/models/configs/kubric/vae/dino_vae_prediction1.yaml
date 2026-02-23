@@ -1,0 +1,23 @@
+
+objective: VAE
+name: "${.model.name}(${.objective}, beta=${.model.beta})"
+
+model:
+  name: "raw_convnext_isotropic_base"
+  dinov2_variant: "vitb14_reg"
+  use_rae_extraction: False
+  feature_stats: "/home/lizijia/Gen-JEPA/vae/data/push_t_dino_b_3000batch.npz"
+  intermediate_layers: [2, 5, 8, 11]
+  patch_size: 14
+  input_dim: 3072
+  depth: 18
+  dim: 768
+  latent_channels: 16
+  drop_path_rate: 0
+  layer_scale_init_value: 0
+  shape: [16, 16]
+  beta: 0
+  rae_stats_path: "/home/lizijia/Gen-JEPA/vae/models/rae/stats/stat.pt"
+
+ckpt_path: /home/lizijia/Gen-JEPA/vae/try/vae_checkpoints/kubric.pt
+latent_dist_stats_path: /home/lizijia/Gen-JEPA/vae/data/kubric_vae_pusht_stats_3000batch.npz

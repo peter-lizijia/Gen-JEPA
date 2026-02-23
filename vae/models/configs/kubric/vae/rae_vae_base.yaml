@@ -1,0 +1,36 @@
+objective: VAE
+name: "${.model.name}(${.objective}, beta=${.model.beta})"
+
+model:
+  name: "raw_convnext_isotropic_base"
+  
+  # === 1. 基础模型 ===
+  dinov2_variant: "dinov2_vitb14_reg"
+  
+  # === 2. 开启 RAE 提取模式 ===
+  # 依然需要 True，因为我们需要 forward_features 的处理逻辑(LayerNorm/Register截断)
+  use_rae_extraction: True
+  
+  # === 3. 统计量 A: 数据集统计量 (用于 VAE 输入/输出标准化) ===
+  # 这里改回你自己的 .npz 文件
+  feature_stats: "/home/lizijia/Gen-JEPA/vae/data/push_t_dino_b_rae_3000batch.npz"
+
+  # === 4. 统计量 B: RAE/ImageNet 统计量 (用于对接 RAE Decoder) ===
+  # 新增字段，指向 stat.pt
+  rae_stats_path: "/home/lizijia/Gen-JEPA/vae/models/rae/stats/stat.pt"
+  
+  # 其他参数
+  input_dim: 768
+  patch_size: 14
+  depth: 18
+  dim: 768
+  latent_channels: 16
+  drop_path_rate: 0
+  layer_scale_init_value: 0
+  shape: [16, 16]
+  beta: 0.0001
+
+ckpt_path: /home/lizijia/Gen-JEPA/vae/models/vae/checkpoints/rae_vae/best_vae.pth
+
+# === 5. 统计量 C: VAE Latent 统计量 (用于 FM) ===
+latent_dist_stats_path: /path/to/your/latent_stats.npz

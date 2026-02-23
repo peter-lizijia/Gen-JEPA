@@ -1,0 +1,22 @@
+defaults:
+  - model: autoregressive_dino_foresight_latent
+  - training: dino_foresight
+  - transforms: dino_foresight
+  - vae: dino_vae_prediction1
+  # - vae: convnext_isotropic_base
+  - _self_
+
+# 1. 核心任务定义
+objective: CFM
+# objective: REG
+name: gen-jepa_pusht_kubric_vae_rae
+
+data:
+  paths: ["/home/lizijia/Gen-JEPA/vae/data/pusht_noise"]
+  frameskip: 5
+
+# 3. 实验路径
+experiment_path: /home/lizijia/Gen-JEPA/experiments/${name}
+
+# resume:
+#   ckpt: /home/lizijia/Gen-JEPA/experiments/pusht_kubric_vae_pred_1/pusht_kubric_vae_pred_1/checkpoints/step_00085000.pt

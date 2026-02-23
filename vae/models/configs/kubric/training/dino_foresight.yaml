@@ -1,0 +1,24 @@
+# Experiment settings
+wandb: true
+seed: 123
+epochs: 3
+steps: 120800
+mixed_precision: true
+
+# Logging & checkpointing
+log_every_steps: 100
+ckpt_every_epochs: 1
+sample_every_epochs: 1
+evaluate_every_epochs: 1
+num_workers: 8
+batch_size: 32
+
+# Optimization
+lr: 8e-5
+clip_grad_norm: 1.0
+accumulation_steps: 1
+lr_scheduler:
+  name: cosine
+
+# Recipe
+recipe: "dino_foresight"
