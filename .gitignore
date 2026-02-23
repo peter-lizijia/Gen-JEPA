@@ -16,6 +16,10 @@ vae/try/wandb/
 *.ckpt
 *.pt
 *.npz
+*.png
+*.jpg
+*.JPEG
+*.sh
 
 __pycache__/
 *.py[cod]
