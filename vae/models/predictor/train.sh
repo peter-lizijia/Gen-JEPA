@@ -29,5 +29,6 @@ export CONFIG_NAME="dino_foresight_cfm"
 
 cd /home/lizijia/Gen-JEPA
 
-torchrun --nproc_per_node=1 --master_port=29508 vae/models/predictor/train.py
-# torchrun --nproc_per_node=1 --master_port=29502 /home/lizijia/Gen-JEPA/vae/models/predictor/eval.py
+# torchrun --nproc_per_node=1 --master_port=29508 vae/models/predictor/train.py
+# torchrun --nproc_per_node=1 --master_port=29503 /home/lizijia/Gen-JEPA/vae/models/predictor/eval.py
+torchrun --nproc_per_node=1 --master_port=29503 /home/lizijia/Gen-JEPA/vae/models/predictor/train.py

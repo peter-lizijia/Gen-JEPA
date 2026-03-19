@@ -1,0 +1,26 @@
+img_size: [224, 224]
+patch_size: 14
+separable_attention: True
+separable_window_size: 1
+layers: 12
+heads: 8
+hidden_dim: 1152
+dropout: 0.1
+
+# User request: three history frames -> predict next frame.
+context_frames: 3
+prediction_frames: 1
+
+action_dim: 10
+proprio_dim: 4
+use_proprio: true
+
+# "fm" -> standard conditional FM with timestep conditioning.
+# "eqm" -> EqM-style FM without timestep conditioning.
+fm_variant: fm
+num_registers: 8
+
+# UWM-style joint FM losses.
+action_loss_weight: 1.0
+state_loss_weight: 1.0
+proprio_loss_weight: 0.1

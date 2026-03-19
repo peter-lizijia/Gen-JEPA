@@ -28,6 +28,5 @@ cd /home/lizijia/Gen-JEPA/vae/try
 unset SSL_CERT_FILE
 
 python /home/lizijia/Gen-JEPA/vae/try/inference_intermediate_rae.py
-# python /home/lizijia/Gen-JEPA/vae/try/test.py
 
 echo "✅ Job finished."

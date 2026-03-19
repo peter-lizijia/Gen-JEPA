@@ -7,16 +7,18 @@ defaults:
   - _self_
 
 # 1. 核心任务定义
-objective: CFM
-# objective: REG
-name: gen-jepa_pusht_kubric_vae_rae
+# objective: CFM
+objective: REG
+name: reg-jepa_pusht_kubric_vae_rae_abs_action
 
 data:
   paths: ["/home/lizijia/Gen-JEPA/vae/data/pusht_noise"]
   frameskip: 5
+  relative_action: false
 
 # 3. 实验路径
 experiment_path: /home/lizijia/Gen-JEPA/experiments/${name}
 
 # resume:
-#   ckpt: /home/lizijia/Gen-JEPA/experiments/pusht_kubric_vae_pred_1/pusht_kubric_vae_pred_1/checkpoints/step_00085000.pt
+#   ckpt: /home/lizijia/Gen-JEPA/experiments/gen-jepa_pusht_kubric_vae_rae/gen-jepa_pusht_kubric_vae_rae/checkpoints/step_00115000.pt
+  # ckpt: /home/lizijia/Gen-JEPA/experiments/reg-jepa_pusht_kubric_vae_rae/reg-jepa_pusht_kubric_vae_rae/checkpoints/step_00115000.pt

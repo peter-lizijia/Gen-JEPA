@@ -360,6 +360,7 @@ def evaluation_step(velocity_module, batch, device):
     # 1. model precision
     raw_model = velocity_module.module if isinstance(velocity_module, DDP) else velocity_module
     model_dtype = next(raw_model.parameters()).dtype
+    data_dtype = torch.float32
     
     n_ctx = raw_model.context_frames
     H_pred = raw_model.prediction_frames
@@ -368,17 +369,17 @@ def evaluation_step(velocity_module, batch, device):
     if isinstance(batch, (list, tuple)):
         x = batch[0]
         if isinstance(x, dict):
-            proprio = x['proprio'].to(device=device, dtype=model_dtype, non_blocking=True)
-            x = x['visual'].to(device=device, dtype=model_dtype, non_blocking=True)
+            proprio = x['proprio'].to(device=device, dtype=data_dtype, non_blocking=True)
+            x = x['visual'].to(device=device, dtype=data_dtype, non_blocking=True)
         else:
-            x = x.to(device=device, dtype=model_dtype, non_blocking=True)
+            x = x.to(device=device, dtype=data_dtype, non_blocking=True)
             proprio = None
 
-        action = batch[1].to(device=device, dtype=model_dtype, non_blocking=True) if len(batch) > 1 else None
+        action = batch[1].to(device=device, dtype=data_dtype, non_blocking=True) if len(batch) > 1 else None
         if len(batch) > 2 and proprio is None:
-            proprio = batch[2].to(device=device, dtype=model_dtype, non_blocking=True)
+            proprio = batch[2].to(device=device, dtype=data_dtype, non_blocking=True)
     else:
-        x = batch.to(device=device, dtype=model_dtype, non_blocking=True)
+        x = batch.to(device=device, dtype=data_dtype, non_blocking=True)
         action, proprio = None, None
 
     # inference
@@ -391,7 +392,7 @@ def evaluation_step(velocity_module, batch, device):
             else:
                 z = raw_model.preprocess(x)
             
-            z = z.to(model_dtype)
+            z = z.to(data_dtype)
 
             # z shape: [B, T, H, W, D]
             z_ctx = z[:, :n_ctx, ...]
@@ -410,7 +411,7 @@ def evaluation_step(velocity_module, batch, device):
                     proprio,
                     steps=num_steps
                 )
-                z_preds.append(z_pred.to(model_dtype))
+                z_preds.append(z_pred.to(data_dtype))
             
             # Stack: [B, K, T, H, W, D]
             z_preds = torch.stack(z_preds, dim=1)
@@ -436,6 +437,7 @@ def evaluation_step(velocity_module, batch, device):
 def evaluation_step_regression(velocity_module, batch, device):
     raw_model = velocity_module.module if isinstance(velocity_module, DDP) else velocity_module
     model_dtype = next(raw_model.parameters()).dtype
+    data_dtype = torch.float32
 
     n_ctx = raw_model.context_frames
     H_pred = raw_model.prediction_frames
@@ -443,17 +445,17 @@ def evaluation_step_regression(velocity_module, batch, device):
     if isinstance(batch, (list, tuple)):
         x = batch[0]
         if isinstance(x, dict):
-            proprio = x['proprio'].to(device=device, dtype=model_dtype, non_blocking=True)
-            x = x['visual'].to(device=device, dtype=model_dtype, non_blocking=True)
+            proprio = x['proprio'].to(device=device, dtype=data_dtype, non_blocking=True)
+            x = x['visual'].to(device=device, dtype=data_dtype, non_blocking=True)
         else:
-            x = x.to(device=device, dtype=model_dtype, non_blocking=True)
+            x = x.to(device=device, dtype=data_dtype, non_blocking=True)
             proprio = None
 
-        action = batch[1].to(device=device, dtype=model_dtype, non_blocking=True) if len(batch) > 1 else None
+        action = batch[1].to(device=device, dtype=data_dtype, non_blocking=True) if len(batch) > 1 else None
         if len(batch) > 2 and proprio is None:
-            proprio = batch[2].to(device=device, dtype=model_dtype, non_blocking=True)
+            proprio = batch[2].to(device=device, dtype=data_dtype, non_blocking=True)
     else:
-        x = batch.to(device=device, dtype=model_dtype, non_blocking=True)
+        x = batch.to(device=device, dtype=data_dtype, non_blocking=True)
         action, proprio = None, None
 
     with torch.amp.autocast('cuda', enabled=True, dtype=model_dtype):
@@ -462,22 +464,22 @@ def evaluation_step_regression(velocity_module, batch, device):
                 z = raw_model.encode(x)
             else:
                 z = raw_model.preprocess(x)
-            z = z.to(model_dtype)
+            z = z.to(data_dtype)
 
             z_ctx = z[:, :n_ctx, ...]
             z_tgt = z[:, n_ctx:n_ctx + H_pred, ...]
 
             model_output = raw_model(
-                z_ctx,
-                action=action,
-                proprio=proprio
+                z_ctx.to(dtype=model_dtype),
+                action=action.to(dtype=model_dtype) if action is not None else None,
+                proprio=proprio.to(dtype=model_dtype) if proprio is not None else None
             )
             if isinstance(model_output, tuple):
                 pred_vis, _ = model_output
             else:
                 pred_vis = model_output
 
-            mean_future_mse = F.mse_loss(pred_vis, z_tgt)
+            mean_future_mse = F.mse_loss(pred_vis.float(), z_tgt.float())
 
     # Keep output signature identical to CFM evaluation for logging compatibility.
     return (mean_future_mse, mean_future_mse, mean_future_mse)
@@ -558,103 +560,129 @@ def sample(
     action=None,
     proprio=None,
     steps=50,
-    method="euler"
+    method="euler",
+    ode_dtype=torch.float32,
 ):
   """
   sample: z_ctx (Context) + Noise -> ODE Integration -> z_pred (Future)
   Flow matching: from Noise to Data, so t=1 is noise, t=0 is data
   """
-  if getattr(velocity, "is_regression_model", False):
-    out = velocity.forward(
-        z_ctx,
-        action=action,
-        proprio=proprio
-    )
-    if isinstance(out, tuple):
-      pred_vis, _ = out
-    else:
-      pred_vis = out
-    return pred_vis, pred_vis.unsqueeze(0)
+  model_dtype = next(velocity.parameters()).dtype
+  device_type = z_ctx.device.type
 
-  H_pred = velocity.prediction_frames
-  n_ctx = velocity.context_frames
-  
-  b, _, h, w, d = z_ctx.shape
-  
-  # t=1: Pure Noise for visual state
-  z_t = torch.randn((b, H_pred, h, w, d), device=z_ctx.device, dtype=z_ctx.dtype)
+  def model_autocast_ctx():
+    if device_type == "cuda" and model_dtype in (torch.float16, torch.bfloat16):
+      return torch.amp.autocast(device_type="cuda", enabled=True, dtype=model_dtype)
+    return nullcontext()
 
-  # If proprio exists, integrate it jointly with visual during FM sampling.
-  use_proprio_fm = proprio is not None
-  if use_proprio_fm:
-    p_ctx = proprio[:, :n_ctx, :]
-    p_dim = p_ctx.shape[-1]
-    p_t = torch.randn((b, H_pred, p_dim), device=z_ctx.device, dtype=z_ctx.dtype)
-  
-  # Time grid: 1.0 -> 0.0
-  tau_grid = torch.linspace(1., 0., steps, device=z_ctx.device, dtype=z_ctx.dtype)
+  amp_off = (
+      torch.amp.autocast(device_type="cuda", enabled=False)
+      if device_type == "cuda"
+      else nullcontext()
+  )
 
-  def v(tau, z_curr):
-    """
-    ODE: dy/dt = v(y, t)
-    """
-    # broadcast tau to [B, ] for batch processing
-    if isinstance(tau, torch.Tensor):
-        t_in = tau.expand(b)
-    else:
-        t_in = torch.tensor([tau], device=z_ctx.device, dtype=z_ctx.dtype).expand(b)
-        
-    # use model
-    out = velocity.forward(
-        z_ctx,
-        z_curr, # current visual state
-        t_in,
-        action=action,
-        proprio=proprio
-    )
-    
-    if isinstance(out, tuple):
+  z_ctx_ode = z_ctx.to(dtype=ode_dtype)
+  action_ode = action.to(device=z_ctx.device, dtype=ode_dtype) if torch.is_tensor(action) else action
+  proprio_ode = proprio.to(device=z_ctx.device, dtype=ode_dtype) if torch.is_tensor(proprio) else proprio
+
+  with amp_off:
+    z_ctx_model = z_ctx_ode.to(dtype=model_dtype)
+    action_model = action_ode.to(dtype=model_dtype) if torch.is_tensor(action_ode) else action_ode
+
+    if getattr(velocity, "is_regression_model", False):
+      proprio_model = proprio_ode.to(dtype=model_dtype) if torch.is_tensor(proprio_ode) else proprio_ode
+      with model_autocast_ctx():
+        out = velocity.forward(
+            z_ctx_model,
+            action=action_model,
+            proprio=proprio_model
+        )
+      if isinstance(out, tuple):
+        pred_vis, _ = out
+      else:
+        pred_vis = out
+      pred_vis = pred_vis.to(dtype=ode_dtype)
+      return pred_vis, pred_vis.unsqueeze(0)
+
+    H_pred = velocity.prediction_frames
+    n_ctx = velocity.context_frames
+
+    b, _, h, w, d = z_ctx_ode.shape
+
+    # t=1: Pure Noise for visual state
+    z_t = torch.randn((b, H_pred, h, w, d), device=z_ctx_ode.device, dtype=ode_dtype)
+
+    # If proprio exists, integrate it jointly with visual during FM sampling.
+    use_proprio_fm = torch.is_tensor(proprio_ode)
+    if use_proprio_fm:
+      p_ctx = proprio_ode[:, :n_ctx, :]
+      p_dim = p_ctx.shape[-1]
+      p_t = torch.randn((b, H_pred, p_dim), device=z_ctx_ode.device, dtype=ode_dtype)
+
+    # Time grid: 1.0 -> 0.0
+    tau_grid = torch.linspace(1.0, 0.0, steps, device=z_ctx_ode.device, dtype=ode_dtype)
+
+    def v(tau, z_curr):
+      if isinstance(tau, torch.Tensor):
+        t_in = tau.expand(b).to(dtype=ode_dtype)
+      else:
+        t_in = torch.tensor([tau], device=z_ctx_ode.device, dtype=ode_dtype).expand(b)
+
+      with model_autocast_ctx():
+        out = velocity.forward(
+            z_ctx_model,
+            z_curr.to(dtype=model_dtype),  # current visual state
+            t_in.to(dtype=model_dtype),
+            action=action_model,
+            proprio=None,
+        )
+
+      if isinstance(out, tuple):
         v_vis, _ = out
-        return v_vis
-    return out
+      else:
+        v_vis = out
+      return v_vis.to(dtype=ode_dtype)
 
-  if not use_proprio_fm:
-    # ODE integration (visual only)
-    z_traj = odeint(v, z_t, tau_grid, method=method)
+    if not use_proprio_fm:
+      # ODE integration (visual only)
+      z_traj = odeint(v, z_t, tau_grid, method=method)
+      return z_traj[-1], z_traj
+
+    def v_joint(tau, state):
+      z_curr, p_curr = state
+      if isinstance(tau, torch.Tensor):
+        t_in = tau.expand(b).to(dtype=ode_dtype)
+      else:
+        t_in = torch.tensor([tau], device=z_ctx_ode.device, dtype=ode_dtype).expand(b)
+
+      proprio_input = torch.cat([p_ctx, p_curr], dim=1)
+      with model_autocast_ctx():
+        out = velocity.forward(
+            z_ctx_model,
+            z_curr.to(dtype=model_dtype),
+            t_in.to(dtype=model_dtype),
+            action=action_model,
+            proprio=proprio_input.to(dtype=model_dtype),
+        )
+
+      if isinstance(out, tuple):
+        v_vis, v_prop = out
+      else:
+        v_vis, v_prop = out, None
+
+      if v_prop is None:
+        v_prop = torch.zeros_like(p_curr)
+      else:
+        v_prop = v_prop.to(dtype=ode_dtype)
+
+      return v_vis.to(dtype=ode_dtype), v_prop
+
+    # ODE integration (visual + proprio). Return visual trajectory for existing callers.
+    z_traj, _ = odeint(v_joint, (z_t, p_t), tau_grid, method=method)
+
+    # z_traj: [Steps, B, H_pred, h, w, d]
+    # return t=0 and full trajectory
     return z_traj[-1], z_traj
-
-  def v_joint(tau, state):
-    z_curr, p_curr = state
-    if isinstance(tau, torch.Tensor):
-      t_in = tau.expand(b)
-    else:
-      t_in = torch.tensor([tau], device=z_ctx.device, dtype=z_ctx.dtype).expand(b)
-
-    proprio_input = torch.cat([p_ctx, p_curr], dim=1)
-    out = velocity.forward(
-        z_ctx,
-        z_curr,
-        t_in,
-        action=action,
-        proprio=proprio_input
-    )
-
-    if isinstance(out, tuple):
-      v_vis, v_prop = out
-    else:
-      v_vis, v_prop = out, None
-
-    if v_prop is None:
-      v_prop = torch.zeros_like(p_curr)
-
-    return v_vis, v_prop
-
-  # ODE integration (visual + proprio). Return visual trajectory for existing callers.
-  z_traj, _ = odeint(v_joint, (z_t, p_t), tau_grid, method=method)
-  
-  # z_traj: [Steps, B, H_pred, h, w, d]
-  # returen t=0 and full trajectory
-  return z_traj[-1], z_traj
 
 
 def visualize_trajectory_rae(gt_images, gt_rae_decoded, pred_rae_decoded_list):
@@ -716,6 +744,7 @@ def visualize_trajectory_rae(gt_images, gt_rae_decoded, pred_rae_decoded_list):
 def plot_samples(model, batch, device, cfg: DictConfig):
     raw_model = model.module if hasattr(model, "module") else model
     model_dtype = next(raw_model.parameters()).dtype
+    data_dtype = torch.float32
     
     n_ctx = raw_model.context_frames
     H_pred = raw_model.prediction_frames
@@ -726,14 +755,14 @@ def plot_samples(model, batch, device, cfg: DictConfig):
     # 1. Prepare Data
     if isinstance(batch, (list, tuple)):
         if isinstance(batch[0], dict):
-            x = batch[0]['visual'].to(device=device, dtype=model_dtype, non_blocking=True)
-            proprio = batch[0]['proprio'].to(device=device, dtype=model_dtype, non_blocking=True)
+            x = batch[0]['visual'].to(device=device, dtype=data_dtype, non_blocking=True)
+            proprio = batch[0]['proprio'].to(device=device, dtype=data_dtype, non_blocking=True)
         else:
-            x = batch[0].to(device=device, dtype=model_dtype, non_blocking=True)
+            x = batch[0].to(device=device, dtype=data_dtype, non_blocking=True)
             proprio = None
-        action = batch[1].to(device=device, dtype=model_dtype, non_blocking=True) if len(batch) > 1 else None
+        action = batch[1].to(device=device, dtype=data_dtype, non_blocking=True) if len(batch) > 1 else None
     else:
-        x = batch.to(device=device, dtype=model_dtype, non_blocking=True)
+        x = batch.to(device=device, dtype=data_dtype, non_blocking=True)
         action, proprio = None, None
 
     with torch.amp.autocast('cuda', enabled=True, dtype=model_dtype):
@@ -761,7 +790,11 @@ def plot_samples(model, batch, device, cfg: DictConfig):
         z_latent_flat = dist.sample() 
         
         # Reshape back to [B, T, H, W, 16]
-        z_latent = einops.rearrange(z_latent_flat, "(b t) h w c -> b t h w c", b=dino_features.shape[0])
+        z_latent = einops.rearrange(
+            z_latent_flat,
+            "(b t) h w c -> b t h w c",
+            b=dino_features.shape[0],
+        ).to(dtype=data_dtype)
         
         # Prepare Context
         z_ctx_0 = z_latent[0:1, :n_ctx, ...]
@@ -781,7 +814,7 @@ def plot_samples(model, batch, device, cfg: DictConfig):
                 proprio[0:1] if proprio is not None else None, 
                 steps=20
             )
-            batch_0_preds_latent.append(z_pred_last[0])
+            batch_0_preds_latent.append(z_pred_last[0].to(dtype=data_dtype))
         
         # =========================================================
         # Step 4: Decode Predictions (Latent -> DINO)
@@ -789,7 +822,7 @@ def plot_samples(model, batch, device, cfg: DictConfig):
         preds_dino_visual = []
         for p in batch_0_preds_latent:
             # Input: [H_pred, h, w, 16] -> Decode -> [H_pred, h, w, 3072]
-            decoded = inner_vae.decode(p)
+            decoded = inner_vae.decode(p.to(dtype=model_dtype))
             preds_dino_visual.append(decoded)
 
         # Prepare RGB ground truth for display
@@ -810,7 +843,11 @@ def plot_samples(model, batch, device, cfg: DictConfig):
             target_dim=768,
             remove_dino_norm_affine=remove_dino_affine_for_rae
         )
-        gt_rae_decoded = rae_model.decode(gt_rae_input.permute(0, 3, 1, 2).float())
+        gt_rae_decoded = torch.clamp(
+            rae_model.decode(gt_rae_input.permute(0, 3, 1, 2).float()),
+            0,
+            1,
+        )
 
         pred_rae_decoded = []
         for pred in preds_dino_visual:
@@ -819,11 +856,14 @@ def plot_samples(model, batch, device, cfg: DictConfig):
                 target_dim=768,
                 remove_dino_norm_affine=remove_dino_affine_for_rae
             )
-            pred_img = rae_model.decode(pred_rae_input.permute(0, 3, 1, 2).float())
+            pred_img = torch.clamp(
+                rae_model.decode(pred_rae_input.permute(0, 3, 1, 2).float()),
+                0,
+                1,
+            )
             pred_rae_decoded.append(pred_img)
 
     pil_image = visualize_trajectory_rae(gt_rgb_images, gt_rae_decoded, pred_rae_decoded)
-    
     return pil_image
 
 
@@ -854,6 +894,7 @@ def train(
   # Data Initialization
   context_len = cfg.model.context_frames
   pred_len = cfg.model.prediction_frames
+  use_relative_action = bool(cfg.data.get("relative_action", True))
 
   # initializing Dataloader
   (
@@ -865,6 +906,7 @@ def train(
       num_workers=8,           
       dataset_type="custom",
       frameskip=cfg.data.frameskip,
+      relative_action=use_relative_action,
       num_hist=context_len, 
       num_pred=pred_len,
       transform=transform,
@@ -975,7 +1017,12 @@ def train(
               samples.save((save_dir / f"step_{step}.jpg"))
               
               if cfg.training.wandb and wandb.run is not None:
-                wandb.log({"val_samples": wandb.Image(samples)}, step=step)
+                wandb.log(
+                    {
+                        "val_samples": wandb.Image(samples),
+                    },
+                    step=step
+                )
           
           # 分布式同步，防止 rank 0 处理图片太慢导致其他卡提前跑下一个 batch 导致死锁
           dist.barrier()
@@ -1043,7 +1090,12 @@ def train(
           samples.save((save_dir / f"step_{step}.jpg"))
           
           if cfg.training.wandb and wandb.run is not None:
-            wandb.log({"val_samples": wandb.Image(samples)}, step=step)
+            wandb.log(
+                {
+                    "val_samples": wandb.Image(samples),
+                },
+                step=step
+            )
 
     dist.barrier()
 

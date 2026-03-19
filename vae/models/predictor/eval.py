@@ -1,276 +1,354 @@
 import os
-import torch
-import hydra
-import logging
+from contextlib import nullcontext
 from pathlib import Path
-from omegaconf import DictConfig, OmegaConf
-import torch.nn.functional as F
-import matplotlib.pyplot as plt
-from sklearn.decomposition import PCA
-import numpy as np
-import einops
 
-# --- 复用 train.py 的组件 ---
+import einops
+import hydra
+import torch
+import torch.distributed as dist
+import torch.nn.functional as F
+from omegaconf import DictConfig, OmegaConf
+
+from data_processing.transforms import make_inverse_transforms, make_transforms
+from data_processing.utils import init_data
+from vae.models.predictor.autoregressive_dino_foresight_latent import (
+    AutoregressiveDINOForesightLatent,
+    AutoregressiveDINOForesightLatentRegressor,
+)
+from vae.models.predictor.train import (
+    evaluate,
+    get_rae_decoder,
+    is_regression_objective,
+    normalize_objective,
+    sample,
+    visualize_trajectory_rae,
+)
 from vae.models.predictor.utilities.ddp import cleanup, setup_ddp
 from vae.models.predictor.utilities.seed import seed_everything
-from vae.models.predictor.autoregressive_dino_foresight_latent import AutoregressiveDINOForesightLatent
-from data_processing.utils import init_data
-from data_processing.transforms import make_inverse_transforms, make_transforms
 
-# --- 直接导入你修改好的函数 ---
-from vae.models.predictor.train import evaluate, plot_samples
 
-# 设置默认配置路径
-config_path = os.environ.get("CONFIG_PATH", "../configs/kubric")
-config_name = os.environ.get("CONFIG_NAME", "dino_foresight_cfm.yaml")
+config_path = os.environ.get(
+    "CONFIG_PATH",
+    "/home/lizijia/Gen-JEPA/vae/models/configs/kubric",
+)
+config_name = os.environ.get(
+    "CONFIG_NAME",
+    "dino_foresight_cfm.yaml",
+)
+
+
+def build_model(cfg: DictConfig):
+    objective = normalize_objective(cfg.objective)
+    model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
+
+    if "vae" not in cfg:
+        raise NotImplementedError("Only VAE-based predictor is supported.")
+
+    if objective == "CFM":
+        model = AutoregressiveDINOForesightLatent(
+            **model_kwargs,
+            vae=cfg.vae,
+        )
+    elif is_regression_objective(objective):
+        model = AutoregressiveDINOForesightLatentRegressor(
+            **model_kwargs,
+            vae=cfg.vae,
+        )
+    else:
+        raise NotImplementedError(f"Unsupported objective: {cfg.objective}")
+    return model
+
+
+def load_checkpoint_to_model(model, ckpt_path: str, device: torch.device, rank: int):
+    if not ckpt_path:
+        raise ValueError("Must provide cfg.resume.ckpt.")
+
+    ckpt = torch.load(ckpt_path, map_location=device)
+    state_dict = ckpt
+
+    if isinstance(ckpt, dict) and "model_state_dict" in ckpt:
+        state_dict = ckpt["model_state_dict"]
+    elif isinstance(ckpt, dict) and "state_dict" in ckpt:
+        state_dict = ckpt["state_dict"]
+    elif isinstance(ckpt, dict) and "ema_state_dict" in ckpt:
+        if rank == 0:
+            print("model_state_dict missing; fallback to ema_state_dict.")
+        state_dict = ckpt["ema_state_dict"]
+
+    fixed_state_dict = {}
+    for k, v in state_dict.items():
+        if isinstance(k, str) and k.startswith("module."):
+            fixed_state_dict[k[7:]] = v
+        else:
+            fixed_state_dict[k] = v
+
+    msg = model.load_state_dict(fixed_state_dict, strict=False)
+    return ckpt, msg
+
+
+def _build_perceptual_metrics(device: torch.device):
+    try:
+        import lpips  # type: ignore
+    except ImportError as exc:
+        raise ImportError("`lpips` is required for LPIPS metric.") from exc
+
+    try:
+        from torchmetrics.functional.image import structural_similarity_index_measure as ssim_fn  # type: ignore
+    except ImportError:
+        from torchmetrics.functional import structural_similarity_index_measure as ssim_fn  # type: ignore
+
+    lpips_metric = lpips.LPIPS(net="alex").to(device).eval()
+    for p in lpips_metric.parameters():
+        p.requires_grad = False
+    return lpips_metric, ssim_fn
+
+
+def _unpack_batch(batch, device: torch.device, dtype: torch.dtype):
+    if isinstance(batch, (list, tuple)):
+        primary = batch[0]
+        if isinstance(primary, dict):
+            x = primary["visual"].to(device=device, dtype=dtype, non_blocking=True)
+            proprio = primary.get("proprio")
+            if proprio is not None:
+                proprio = proprio.to(device=device, dtype=dtype, non_blocking=True)
+        else:
+            x = primary.to(device=device, dtype=dtype, non_blocking=True)
+            proprio = None
+
+        action = (
+            batch[1].to(device=device, dtype=dtype, non_blocking=True)
+            if len(batch) > 1 and torch.is_tensor(batch[1])
+            else None
+        )
+        if len(batch) > 2 and proprio is None and torch.is_tensor(batch[2]):
+            proprio = batch[2].to(device=device, dtype=dtype, non_blocking=True)
+    else:
+        x = batch.to(device=device, dtype=dtype, non_blocking=True)
+        action, proprio = None, None
+    return x, action, proprio
+
 
 @torch.inference_mode()
-def check_vae_reconstruction(model, batch, device):
-    """
-    [诊断工具] VAE 重构检查
-    用于确认 VAE 是否工作正常，以及 Latent 是否包含细节信息。
-    """
-    # ==========================================
-    # 1. 准备模型和工具
-    # ==========================================
+def _compute_viz_sample_perceptual_metrics(model, batch, device: torch.device, cfg: DictConfig):
+    lpips_metric, ssim_fn = _build_perceptual_metrics(device)
+    rae_model = get_rae_decoder(cfg, device)
     raw_model = model.module if hasattr(model, "module") else model
     model_dtype = next(raw_model.parameters()).dtype
-    inv_transform = make_inverse_transforms(img_size=224) 
+    data_dtype = torch.float32
+    n_ctx = raw_model.context_frames
+    h_pred = raw_model.prediction_frames
+    objective = normalize_objective(cfg.objective)
+    remove_affine = bool(cfg.vae.get("remove_dino_norm_affine_for_rae", True))
+    inv_transform = make_inverse_transforms(img_size=224)
 
-    # ==========================================
-    # 2. 准备数据
-    # ==========================================
-    # 提取第一帧 [1, 1, C, H, W]
-    if isinstance(batch, (list, tuple)):
-        if isinstance(batch[0], dict):
-            x = batch[0]['visual'][0:1, 0:1, ...].to(device=device, dtype=model_dtype)
-        else:
-            x = batch[0][0:1, 0:1, ...].to(device=device, dtype=model_dtype)
-    else:
-        x = batch[0:1, 0:1, ...].to(device=device, dtype=model_dtype)
+    x, action, proprio = _unpack_batch(batch, device, data_dtype)
+    gt_raw_frames = x[0, n_ctx:n_ctx + h_pred, ...].float().cpu()
+    gt_rgb_images = torch.clamp(inv_transform(gt_raw_frames), 0, 1)
 
-    print(f"\n--- [Diagnosis] Feature Statistics ---")
-    
-    with torch.amp.autocast('cuda', enabled=True, dtype=model_dtype):
-        # A. 获取 GT DINO 特征
-        # 注意：这里调用 preprocess，确保输入归一化是对的
-        feat_gt = raw_model.vae.preprocess(x) 
-        
-        # B. VAE 重构
-        feat_flat = einops.rearrange(feat_gt, "b t h w c -> (b t) h w c")
-        inner_vae = raw_model.vae.vae if hasattr(raw_model.vae, 'vae') else raw_model.vae
-        
-        # 使用 mode() 取均值
-        dist = inner_vae.encode(feat_flat)
-        z = dist.mode() 
-        feat_recon_flat = inner_vae.decode(z)
-        feat_recon = einops.rearrange(feat_recon_flat, "(b t) h w c -> b t h w c", b=1, t=1)
+    autocast_ctx = (
+        torch.amp.autocast(device_type="cuda", enabled=True, dtype=model_dtype)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with autocast_ctx:
+        # Keep this exactly aligned with train.py::plot_samples.
+        dino_features = raw_model.vae.preprocess(x)
+        gt_dino = dino_features[0, n_ctx:n_ctx + h_pred, ...]
 
-    # ==========================================
-    # 3. 数值诊断
-    # ==========================================
-    gt_np = feat_gt.float().cpu().numpy().reshape(-1, 3072)
-    recon_np = feat_recon.float().cpu().numpy().reshape(-1, 3072)
+        inner_vae = raw_model.vae.vae if hasattr(raw_model.vae, "vae") else raw_model.vae
+        dino_flat = einops.rearrange(dino_features, "b t h w c -> (b t) h w c")
+        z_latent_flat = inner_vae.encode(dino_flat).sample()
+        z_latent = einops.rearrange(
+            z_latent_flat,
+            "(b t) h w c -> b t h w c",
+            b=dino_features.shape[0],
+        ).to(dtype=data_dtype)
+        z_ctx_0 = z_latent[0:1, :n_ctx, ...]
+        gt_latent = z_latent[0, n_ctx:n_ctx + h_pred, ...]
 
-    print(f"GT    Range: [{gt_np.min():.2f}, {gt_np.max():.2f}] | Std: {gt_np.std():.4f}")
-    print(f"Recon Range: [{recon_np.min():.2f}, {recon_np.max():.2f}] | Std: {recon_np.std():.4f}")
-    
-    std_ratio = recon_np.std() / (gt_np.std() + 1e-6)
-    print(f"Ratio (Recon/GT): {std_ratio:.2f}")
+        num_viz_samples = 1 if getattr(raw_model, "is_regression_model", False) else 3
+        pred_latent_list = []
+        for _ in range(num_viz_samples):
+            if is_regression_objective(objective) or getattr(raw_model, "is_regression_model", False):
+                out = raw_model(
+                    z_ctx_0.to(dtype=model_dtype),
+                    action=action[0:1].to(dtype=model_dtype) if action is not None else None,
+                    proprio=proprio[0:1].to(dtype=model_dtype) if proprio is not None else None,
+                )
+                z_pred = out[0] if isinstance(out, tuple) else out
+            else:
+                z_pred, _ = sample(
+                    raw_model,
+                    z_ctx_0,
+                    action=action[0:1] if action is not None else None,
+                    proprio=proprio[0:1] if proprio is not None else None,
+                    steps=20,
+                )
+            pred_latent_list.append(z_pred[0].float())
 
-    # ==========================================
-    # 4. 可视化处理
-    # ==========================================
-    
-    # A. 统一 PCA (Shared) - 展示真实差异
-    pca = PCA(n_components=3)
-    pca.fit(gt_np) 
-    
-    gt_pca_shared = pca.transform(gt_np)
-    recon_pca_shared = pca.transform(recon_np)
-    
-    # 归一化 (以 GT 为基准)
-    p_min, p_max = gt_pca_shared.min(axis=0), gt_pca_shared.max(axis=0)
-    range_val = p_max - p_min + 1e-6
-    
-    gt_vis_shared = (gt_pca_shared - p_min) / range_val
-    recon_vis_shared = (recon_pca_shared - p_min) / range_val
-    
-    # B. 独立 PCA (Independent) - 强行拉伸对比度
-    r_min, r_max = recon_pca_shared.min(axis=0), recon_pca_shared.max(axis=0)
-    recon_vis_indep = (recon_pca_shared - r_min) / (r_max - r_min + 1e-6)
+    amp_off = (
+        torch.amp.autocast(device_type="cuda", enabled=False)
+        if device.type == "cuda"
+        else nullcontext()
+    )
+    with amp_off:
+        gt_rae = raw_model.vae.convert_to_rae_space(
+            gt_dino.float(),
+            target_dim=768,
+            remove_dino_norm_affine=remove_affine,
+        )
+        gt_rae = einops.rearrange(gt_rae, "t h w c -> t c h w")
+        gt_rgb = torch.clamp(rae_model.decode(gt_rae), 0, 1).float()
 
-    # C. RGB 还原
-    img_tensor = x[0].float().cpu() # [1, C, H, W]
-    img_rgb = inv_transform(img_tensor)
-    img_rgb = torch.clamp(img_rgb, 0, 1)
-    img_rgb = img_rgb[0].permute(1, 2, 0).numpy() # [H, W, C]
+        sample_metrics = []
+        pred_rgb_vis = []
+        gt_latent_float = gt_latent.float()
+        for pred_latent in pred_latent_list:
+            pred_latent_clean = pred_latent.float()
+            latent_mse = F.mse_loss(pred_latent_clean, gt_latent_float)
 
-    # ==========================================
-    # 5. 绘图
-    # ==========================================
-    h, w = feat_gt.shape[2], feat_gt.shape[3]
-    
-    fig, axs = plt.subplots(1, 4, figsize=(20, 5))
-    
-    # 1. Original RGB
-    axs[0].imshow(img_rgb)
-    axs[0].set_title("Original RGB")
-    axs[0].axis('off')
-    
-    # 2. GT PCA
-    axs[1].imshow(gt_vis_shared.reshape(h, w, 3).clip(0, 1))
-    axs[1].set_title("GT Feature PCA")
-    axs[1].axis('off')
-    
-    # 3. Recon PCA (Shared Scale)
-    axs[2].imshow(recon_vis_shared.reshape(h, w, 3).clip(0, 1))
-    axs[2].set_title(f"Recon (True Scale)\nstd_ratio={std_ratio:.2f}")
-    axs[2].axis('off')
-    
-    # 4. Recon PCA (Normalized)
-    axs[3].imshow(recon_vis_indep.reshape(h, w, 3).clip(0, 1))
-    axs[3].set_title("Recon (Auto-Contrast)\nCheck structure here!")
-    axs[3].axis('off')
-    
-    plt.tight_layout()
-    return fig
+            pred_dino = inner_vae.decode(pred_latent_clean.to(dtype=model_dtype))
+            pred_rae = raw_model.vae.convert_to_rae_space(
+                pred_dino.float(),
+                target_dim=768,
+                remove_dino_norm_affine=remove_affine,
+            )
+            pred_rae = einops.rearrange(pred_rae, "t h w c -> t c h w")
+            pred_rgb = torch.clamp(rae_model.decode(pred_rae), 0, 1).float()
 
-@hydra.main(version_base=None, config_path=config_path, config_name=config_name)
+            if pred_rgb.shape[-2:] != gt_rgb.shape[-2:]:
+                pred_rgb = F.interpolate(pred_rgb, size=gt_rgb.shape[-2:], mode="bilinear", align_corners=False)
+
+            try:
+                ssim_val = ssim_fn(pred_rgb, gt_rgb, data_range=1.0, reduction="elementwise_mean")
+            except TypeError:
+                ssim_val = ssim_fn(pred_rgb, gt_rgb, data_range=1.0)
+            if not torch.is_tensor(ssim_val):
+                ssim_val = torch.tensor(float(ssim_val), device=device)
+            if ssim_val.ndim > 0:
+                ssim_val = ssim_val.mean()
+
+            lpips_val = lpips_metric(pred_rgb * 2 - 1, gt_rgb * 2 - 1).view(-1).mean()
+            sample_metrics.append(
+                {
+                    "latent_mse": float(latent_mse.item()),
+                    "ssim": float(ssim_val.item()),
+                    "lpips": float(lpips_val.item()),
+                }
+            )
+            pred_rgb_vis.append(pred_rgb)
+
+    if not sample_metrics:
+        raise RuntimeError("No visualization samples were produced for SSIM/LPIPS.")
+
+    mean_latent_mse = sum(v["latent_mse"] for v in sample_metrics) / len(sample_metrics)
+    mean_ssim = sum(v["ssim"] for v in sample_metrics) / len(sample_metrics)
+    mean_lpips = sum(v["lpips"] for v in sample_metrics) / len(sample_metrics)
+    pil_image = visualize_trajectory_rae(gt_rgb_images, gt_rgb, pred_rgb_vis)
+    rae_hw = (int(gt_rgb.shape[-2]), int(gt_rgb.shape[-1]))
+    return pil_image, sample_metrics, mean_latent_mse, mean_ssim, mean_lpips, rae_hw
+
+
+@hydra.main(
+    version_base=None,
+    config_path=config_path,
+    config_name=config_name,
+)
 def main(cfg: DictConfig):
     rank, world_size, local_rank, device = setup_ddp()
     seed_everything(cfg.training.seed + rank)
 
     if rank == 0:
-        print(f"--- Evaluation Mode (Clean Version) ---")
+        print("--- Evaluation Mode (train.py-aligned) ---")
         print(f"Checkpoint: {cfg.resume.ckpt}")
 
-    # =========================================================
-    # 1. 初始化模型 (标准方式)
-    # =========================================================
-    # 安全地解包参数，避免 action_dim 重复报错 (如果之前改了 train.py 这步也是安全的)
-    model_kwargs = OmegaConf.to_container(cfg.model, resolve=True)
-    # 如果 cfg.model 里有 action_dim，这里就自动带上了；如果没有，模型会去读默认值
-    
-    if "vae" in cfg:
-        model = AutoregressiveDINOForesightLatent(**model_kwargs, vae=cfg.vae)
-    else:
-        raise NotImplementedError("Model type not supported.")
+    model = build_model(cfg).to(device).bfloat16().eval()
+    ckpt, msg = load_checkpoint_to_model(model, cfg.resume.ckpt, device, rank)
 
-    model = model.to(device).bfloat16()
-    model.eval()
-
-    if not cfg.resume.ckpt:
-        raise ValueError("Error: Must provide resume.ckpt path!")
-
-    # =========================================================
-    # 2. 加载权重 (标准方式)
-    # =========================================================
-    ckpt_path = cfg.resume.ckpt
-    print(f"Loading weights from {ckpt_path}...")
-    
-    ckpt = torch.load(ckpt_path, map_location=device)
-    
-    # 兼容性处理：提取 model_state_dict
-    state_dict = ckpt
-    if "model_state_dict" in ckpt:
-        state_dict = ckpt["model_state_dict"]
-    elif "state_dict" in ckpt:
-        state_dict = ckpt["state_dict"]
-    elif "ema_state_dict" in ckpt: # 也可以选择加载 EMA 权重进行评估
-        print("Note: Loading EMA weights for evaluation.")
-        state_dict = ckpt["ema_state_dict"]
-
-    # 处理 DDP 的 'module.' 前缀问题
-    # 如果 checkpoint 有 module. 但当前模型没有 (或者反之)，需要调整 key
-    new_state_dict = {}
-    for k, v in state_dict.items():
-        name = k
-        if name.startswith("module."):
-            name = name[7:] # 去掉 module.
-        new_state_dict[name] = v
-    
-    # 加载权重
-    # strict=True 是最佳实践，因为现在 key 应该完全匹配了
-    # 但如果为了容错，可以改回 strict=False 并打印 missing_keys
-    msg = model.load_state_dict(new_state_dict, strict=False)
-    
     if rank == 0:
         print(f"Load Result: {msg}")
-        if len(msg.missing_keys) > 0:
-            print(f"⚠️ Warning: Missing keys: {msg.missing_keys[:5]} ...")
-            # 只有当 missing 的不是 VAE 核心层时才忽略
-            if any("encoder" in k for k in msg.missing_keys):
-                print("❌ CRITICAL: VAE keys seem to be missing! Check your checkpoint.")
 
-    # =========================================================
-    # 3. 准备数据
-    # =========================================================
-    img_size = 224
-    transform = make_transforms(img_size=img_size)
-    
-    # 注意：这里 num_pred=1 是为了可视化方便，你可以根据需要改回 cfg.model.prediction_frames
-    (_, _, _, _, _, val_dataloader, _, viz_val_loader) = init_data(
+    transform = make_transforms(img_size=224)
+    (
+        _dataset,
+        _val_dataset,
+        _traj_dataset,
+        _val_traj_dataset,
+        _train_dataloader,
+        val_dataloader,
+        _dist_sampler,
+        viz_val_loader,
+    ) = init_data(
         data_paths=cfg.data.paths,
-        batch_size=cfg.training.batch_size,          
-        num_workers=4,           
+        batch_size=cfg.training.batch_size,
+        num_workers=8,
         dataset_type="custom",
         frameskip=cfg.data.frameskip,
         num_hist=cfg.model.context_frames,
-        num_pred=cfg.model.prediction_frames, 
+        num_pred=cfg.model.prediction_frames,
         transform=transform,
-        pin_mem=True,        
-        persistent_workers=True, 
-        rank=rank,             
+        pin_mem=True,
+        persistent_workers=True,
+        rank=rank,
         world_size=world_size,
-        n_rollout=None 
+        n_rollout=None,
     )
 
-    # =========================================================
-    # 4. 执行评估与可视化 (仅 Rank 0)
-    # =========================================================
-    
-    # A. 计算指标 (全员参与)
-    print("Running evaluation metrics...")
     eval_loader = viz_val_loader if viz_val_loader is not None else val_dataloader
-    # mean_future_mse, min_of_k_mse, mean_of_k_mse = evaluate(model, eval_loader, device)
-    
-    if rank == 0:
-        # print(f"\n[Evaluation Result]")
-        # print(f"Mean Future MSE: {mean_future_mse.item():.6f}")
-        # print(f"Min of K MSE:    {min_of_k_mse.item():.6f}")
 
-        print("\n" + "="*40)
-        print("Generating visualization samples...")
-        
+    mean_future_mse, min_of_k_mse, mean_of_k_mse = evaluate(
+        model,
+        eval_loader,
+        device,
+        objective=cfg.objective,
+    )
+
+    for batch_viz in eval_loader:
+        break
+    else:
+        raise RuntimeError("Validation dataloader is empty.")
+
+    if rank == 0:
+        step_num = ckpt.get("step", 0) if isinstance(ckpt, dict) else 0
+        viz_seed = int(cfg.training.seed) + int(step_num)
+        torch.manual_seed(viz_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(viz_seed)
+        pil_image, sample_metrics, mean_latent_mse, mean_ssim, mean_lpips, rae_hw = _compute_viz_sample_perceptual_metrics(
+            model,
+            batch_viz,
+            device,
+            cfg,
+        )
+
+        # Reset the same seed so the rendered samples are the same ones used for SSIM/LPIPS.
+        torch.manual_seed(viz_seed)
+        if torch.cuda.is_available():
+            torch.cuda.manual_seed_all(viz_seed)
+
+        print("\n[Evaluation Result]")
+        print(f"Mean Future MSE: {mean_future_mse.item():.6f}")
+        print(f"Min of K MSE:    {min_of_k_mse.item():.6f}")
+        print(f"Mean of K MSE:   {mean_of_k_mse.item():.6f}")
+        for i, m in enumerate(sample_metrics, start=1):
+            print(f"Sample-{i} Latent MSE: {m['latent_mse']:.6f}")
+            print(f"Sample-{i} SSIM:  {m['ssim']:.6f}")
+            print(f"Sample-{i} LPIPS: {m['lpips']:.6f}")
+        print(f"Mean Latent MSE: {mean_latent_mse:.6f}")
+        print(f"Mean SSIM:       {mean_ssim:.6f}")
+        print(f"Mean LPIPS:      {mean_lpips:.6f}")
+        print(f"RAE decode size: {rae_hw[0]}x{rae_hw[1]}")
+        print(f"Is 256x256:      {rae_hw == (256, 256)}")
+
         save_dir = Path(cfg.experiment_path) / cfg.name / "eval_results"
         save_dir.mkdir(parents=True, exist_ok=True)
-
-        # 取一个 Batch
-        viz_batch = next(iter(val_dataloader))
-
-        # 1. 专项检查 VAE 重构 (Diagnosis)
-        print("Running VAE reconstruction check...")
-        try:
-            fig = check_vae_reconstruction(model, viz_batch, device)
-            step_num = ckpt.get('step', 0) if isinstance(ckpt, dict) else 0
-            vae_debug_path = save_dir / f"vae_recon_check_{step_num}.png"
-            fig.savefig(vae_debug_path)
-            print(f"VAE debug image saved to: {vae_debug_path}")
-            plt.close(fig) 
-        except Exception as e:
-            print(f"Error in VAE check: {e}")
-        
-        # 2. 运行完整的 plot_samples (Prediction)
-        print("Plotting prediction samples...")
-        pil_image = plot_samples(model, viz_batch, device)
-        
-        step_num = ckpt.get('step', 0) if isinstance(ckpt, dict) else 0
         save_path = save_dir / f"eval_prediction_{step_num:08d}.jpg"
         pil_image.save(save_path)
-        print(f"Sample image saved to: {save_path}")
+        print(f"Saved visualization to: {save_path}")
 
+    dist.barrier()
     cleanup()
+
 
 if __name__ == "__main__":
     main()

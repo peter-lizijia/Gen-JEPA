@@ -20,6 +20,9 @@ log = get_logger(__name__)
 # precomputed dataset stats
 ACTION_MEAN = torch.tensor([-0.0087, 0.0068])
 ACTION_STD = torch.tensor([0.2019, 0.2002])
+# Computed from PushT train split abs_actions only, after /100 scaling.
+ABS_ACTION_MEAN = torch.tensor([2.2748856544, 2.9434509277])
+ABS_ACTION_STD = torch.tensor([1.0336624384, 0.9791054130])
 STATE_MEAN = torch.tensor([236.6155, 264.5674, 255.1307, 266.3721, 1.9584, -2.93032027, 2.54307914])
 STATE_STD = torch.tensor([101.1202, 87.0112, 52.7054, 57.4971, 1.7556, 74.84556075, 74.14009094])
 PROPRIO_MEAN = torch.tensor([236.6155, 264.5674, -2.93032027, 2.54307914])
@@ -86,8 +89,12 @@ class PushTDataset(TrajDataset):
         self.proprio_dim = self.proprios.shape[-1]
 
         if normalize_action:
-            self.action_mean = ACTION_MEAN
-            self.action_std = ACTION_STD
+            if self.relative:
+                self.action_mean = ACTION_MEAN
+                self.action_std = ACTION_STD
+            else:
+                self.action_mean = ABS_ACTION_MEAN
+                self.action_std = ABS_ACTION_STD
             self.state_mean = STATE_MEAN[: self.state_dim]
             self.state_std = STATE_STD[: self.state_dim]
             self.proprio_mean = PROPRIO_MEAN[: self.proprio_dim]
@@ -142,6 +149,7 @@ def load_pusht_slice_train_val(
     n_rollout=50,
     data_path="/data/datasets/pusht_dataset",
     normalize_action=True,
+    relative_action=True,
     split_ratio=0.8,
     num_hist=0,
     num_pred=0,
@@ -157,6 +165,7 @@ def load_pusht_slice_train_val(
         transform=transform,
         data_path=data_path + "/train",
         normalize_action=normalize_action,
+        relative=relative_action,
         with_velocity=with_velocity,
     )
     val_dset = PushTDataset(
@@ -164,6 +173,7 @@ def load_pusht_slice_train_val(
         transform=transform,
         data_path=data_path + "/val",
         normalize_action=normalize_action,
+        relative=relative_action,
         with_velocity=with_velocity,
     )
 
@@ -198,6 +208,7 @@ def load_pusht_test_data(
     data_path,  # 这里传入你切分好的 test 文件夹绝对路径
     n_rollout=None,
     normalize_action=True,
+    relative_action=True,
     num_hist=3,
     num_pred=1,
     frameskip=5,
@@ -213,6 +224,7 @@ def load_pusht_test_data(
         transform=transform,
         data_path=data_path + "/test",
         normalize_action=normalize_action,
+        relative=relative_action,
         with_velocity=with_velocity,
     )
 

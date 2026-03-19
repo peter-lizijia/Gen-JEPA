@@ -1,0 +1,30 @@
+defaults:
+  - model: joint_fm_latent_predictor
+  - training: dino_foresight
+  - transforms: dino_foresight
+  - vae: dino_vae_prediction1
+  - _self_
+
+# Generative branch only.
+objective: CFM
+name: gen-jepa_pusht_kubric_vae_joint_${model.fm_variant}
+
+data:
+  paths: ["/home/lizijia/Gen-JEPA/vae/data/pusht_noise"]
+  frameskip: 5
+  relative_action: false
+
+experiment_path: /home/lizijia/Gen-JEPA/experiments/${name}
+
+training:
+  wandb: false
+  eval_fm_steps: 50
+  sample_fm_steps: 50
+  smoke_test: true
+  smoke_train_batches: 1
+  smoke_eval_batches: 1
+  smoke_ckpt_name: smoke_${model.fm_variant}_one_batch.pt
+
+# Optional resume checkpoint.
+# resume:
+#   ckpt: /path/to/checkpoint.pt
