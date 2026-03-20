@@ -23,3 +23,7 @@ vae/try/wandb/
 
 __pycache__/
 *.py[cod]
+
+# Keep local nested repos out of the parent index.
+stochastic_pusht/traffic_pusht/
+stochastic_pusht/windy-pusht/
